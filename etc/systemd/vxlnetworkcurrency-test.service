@@ -1,0 +1,13 @@
+[Unit]
+Description=Vxlnetwork Test Network Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=vxlnetworkcurrency
+WorkingDirectory=/var/vxlnetworkcurrency/VxlnetworkTest
+ExecStart=/usr/bin/vxlnetwork_node --daemon --network=test --data_path=/var/vxlnetworkcurrency/VxlnetworkTest
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

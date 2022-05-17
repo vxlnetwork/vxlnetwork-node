@@ -1,0 +1,13 @@
+[Unit]
+Description=Vxlnetwork Beta Network Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=vxlnetworkcurrency
+WorkingDirectory=/var/vxlnetworkcurrency/VxlnetworkBeta
+ExecStart=/usr/bin/vxlnetwork_node --daemon --network=beta --data_path=/var/vxlnetworkcurrency/VxlnetworkBeta
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

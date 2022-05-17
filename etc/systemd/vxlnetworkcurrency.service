@@ -1,0 +1,13 @@
+[Unit]
+Description=Vxlnetwork Live Network Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=vxlnetworkcurrency
+WorkingDirectory=/var/vxlnetworkcurrency/Vxlnetwork
+ExecStart=/usr/bin/vxlnetwork_node --daemon --data_path=/var/vxlnetworkcurrency/Vxlnetwork
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

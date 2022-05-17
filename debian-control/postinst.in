@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set +e
+
+useradd -r vxlnetworkcurrency
+groupadd -r vxlnetworkcurrency
+
+mkdir -p /var/vxlnetworkcurrency/Vxlnetwork
+mkdir -p /var/vxlnetworkcurrency/VxlnetworkBeta
+mkdir -p /var/vxlnetworkcurrency/VxlnetworkTest
+chown -R vxlnetworkcurrency: /var/vxlnetworkcurrency
+
+systemctl stop ${VXLNETWORK_SERVICE} 2>/dev/null
+systemctl disable ${VXLNETWORK_SERVICE} 2>/dev/null
+cp ${CMAKE_INSTALL_PREFIX}/extras/systemd/${VXLNETWORK_SERVICE} /etc/systemd/system/${VXLNETWORK_SERVICE}
+systemctl daemon-reload
+systemctl enable ${VXLNETWORK_SERVICE}
+systemctl start ${VXLNETWORK_SERVICE}
+sleep 1
+systemctl --no-pager status ${VXLNETWORK_SERVICE}
+
+set -e

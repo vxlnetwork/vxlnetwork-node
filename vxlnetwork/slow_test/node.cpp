@@ -1,0 +1,1935 @@
+#include <vxlnetwork/crypto_lib/random_pool.hpp>
+#include <vxlnetwork/lib/threading.hpp>
+#include <vxlnetwork/node/election.hpp>
+#include <vxlnetwork/node/transport/udp.hpp>
+#include <vxlnetwork/node/unchecked_map.hpp>
+#include <vxlnetwork/test_common/network.hpp>
+#include <vxlnetwork/test_common/system.hpp>
+#include <vxlnetwork/test_common/testutil.hpp>
+
+#include <gtest/gtest.h>
+
+#include <boost/format.hpp>
+#include <boost/unordered_set.hpp>
+
+#include <numeric>
+#include <random>
+
+using namespace std::chrono_literals;
+
+/**
+ * function to count the block in the pruned store one by one
+ * we manually count the blocks one by one because the rocksdb count feature is not accurate
+ */
+size_t manually_count_pruned_blocks (vxlnetwork::store & store)
+{
+	size_t count = 0;
+	auto transaction = store.tx_begin_read ();
+	auto i = store.pruned.begin (transaction);
+	for (; i != store.pruned.end (); ++i)
+	{
+		++count;
+	}
+	return count;
+}
+
+TEST (system, generate_mass_activity)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.enable_voting = false; // Prevent blocks cementing
+	auto node = system.add_node (node_config);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	uint32_t count (20);
+	system.generate_mass_activity (count, *system.nodes[0]);
+	auto transaction (system.nodes[0]->store.tx_begin_read ());
+	for (auto i (system.nodes[0]->store.account.begin (transaction)), n (system.nodes[0]->store.account.end ()); i != n; ++i)
+	{
+	}
+}
+
+TEST (system, generate_mass_activity_long)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.enable_voting = false; // Prevent blocks cementing
+	auto node = system.add_node (node_config);
+	vxlnetwork::thread_runner runner (system.io_ctx, system.nodes[0]->config.io_threads);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	uint32_t count (1000000);
+	auto count_env_var = std::getenv ("SLOW_TEST_SYSTEM_GENERATE_MASS_ACTIVITY_LONG_COUNT");
+	if (count_env_var)
+	{
+		count = boost::lexical_cast<uint32_t> (count_env_var);
+		std::cout << "count override due to env variable set, count=" << count << std::endl;
+	}
+	system.generate_mass_activity (count, *system.nodes[0]);
+	auto transaction (system.nodes[0]->store.tx_begin_read ());
+	for (auto i (system.nodes[0]->store.account.begin (transaction)), n (system.nodes[0]->store.account.end ()); i != n; ++i)
+	{
+	}
+	system.stop ();
+	runner.join ();
+}
+
+TEST (system, receive_while_synchronizing)
+{
+	std::vector<boost::thread> threads;
+	{
+		vxlnetwork::system system;
+		vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+		node_config.enable_voting = false; // Prevent blocks cementing
+		auto node = system.add_node (node_config);
+		vxlnetwork::thread_runner runner (system.io_ctx, system.nodes[0]->config.io_threads);
+		system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+		uint32_t count (1000);
+		system.generate_mass_activity (count, *system.nodes[0]);
+		vxlnetwork::keypair key;
+		auto node1 (std::make_shared<vxlnetwork::node> (system.io_ctx, vxlnetwork::get_available_port (), vxlnetwork::unique_path (), system.logging, system.work));
+		ASSERT_FALSE (node1->init_error ());
+		auto wallet (node1->wallets.create (1));
+		wallet->insert_adhoc (vxlnetwork::dev::genesis_key.prv); // For voting
+		ASSERT_EQ (key.pub, wallet->insert_adhoc (key.prv));
+		node1->start ();
+		system.nodes.push_back (node1);
+		ASSERT_NE (nullptr, vxlnetwork::establish_tcp (system, *node1, node->network.endpoint ()));
+		node1->workers.add_timed_task (std::chrono::steady_clock::now () + std::chrono::milliseconds (200), ([&system, &key] () {
+			auto hash (system.wallet (0)->send_sync (vxlnetwork::dev::genesis_key.pub, key.pub, system.nodes[0]->config.receive_minimum.number ()));
+			auto transaction (system.nodes[0]->store.tx_begin_read ());
+			auto block (system.nodes[0]->store.block.get (transaction, hash));
+			std::string block_text;
+			block->serialize_json (block_text);
+		}));
+		ASSERT_TIMELY (10s, !node1->balance (key.pub).is_zero ());
+		node1->stop ();
+		system.stop ();
+		runner.join ();
+	}
+	for (auto i (threads.begin ()), n (threads.end ()); i != n; ++i)
+	{
+		i->join ();
+	}
+}
+
+TEST (ledger, deep_account_compute)
+{
+	vxlnetwork::logger_mt logger;
+	auto store = vxlnetwork::make_store (logger, vxlnetwork::unique_path (), vxlnetwork::dev::constants);
+	ASSERT_FALSE (store->init_error ());
+	vxlnetwork::stat stats;
+	vxlnetwork::ledger ledger (*store, stats, vxlnetwork::dev::constants);
+	auto transaction (store->tx_begin_write ());
+	store->initialize (transaction, ledger.cache);
+	vxlnetwork::work_pool pool{ vxlnetwork::dev::network_params.network, std::numeric_limits<unsigned>::max () };
+	vxlnetwork::keypair key;
+	auto balance (vxlnetwork::dev::constants.genesis_amount - 1);
+	vxlnetwork::send_block send (vxlnetwork::dev::genesis->hash (), key.pub, balance, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *pool.generate (vxlnetwork::dev::genesis->hash ()));
+	ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, send).code);
+	vxlnetwork::open_block open (send.hash (), vxlnetwork::dev::genesis_key.pub, key.pub, key.prv, key.pub, *pool.generate (key.pub));
+	ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, open).code);
+	auto sprevious (send.hash ());
+	auto rprevious (open.hash ());
+	for (auto i (0), n (100000); i != n; ++i)
+	{
+		balance -= 1;
+		vxlnetwork::send_block send (sprevious, key.pub, balance, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *pool.generate (sprevious));
+		ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, send).code);
+		sprevious = send.hash ();
+		vxlnetwork::receive_block receive (rprevious, send.hash (), key.prv, key.pub, *pool.generate (rprevious));
+		ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, receive).code);
+		rprevious = receive.hash ();
+		if (i % 100 == 0)
+		{
+			std::cerr << i << ' ';
+		}
+		ledger.account (transaction, sprevious);
+		ledger.balance (transaction, rprevious);
+	}
+}
+
+/*
+ * This test case creates a node and a wallet primed with the genesis account credentials.
+ * Then it spawns 'num_of_threads' threads, each doing 'num_of_sends' async sends
+ * of 1000 raw each time. The test is considered a success, if the balance of the genesis account
+ * reduces by 'num_of_threads * num_of_sends * 1000'.
+ */
+TEST (wallet, multithreaded_send_async)
+{
+	std::vector<boost::thread> threads;
+	{
+		vxlnetwork::system system (1);
+		vxlnetwork::keypair key;
+		auto wallet_l (system.wallet (0));
+		wallet_l->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+		wallet_l->insert_adhoc (key.prv);
+		int num_of_threads = 20;
+		int num_of_sends = 1000;
+		for (auto i (0); i < num_of_threads; ++i)
+		{
+			threads.push_back (boost::thread ([wallet_l, &key, num_of_threads, num_of_sends] () {
+				for (auto i (0); i < num_of_sends; ++i)
+				{
+					wallet_l->send_async (vxlnetwork::dev::genesis_key.pub, key.pub, 1000, [] (std::shared_ptr<vxlnetwork::block> const & block_a) {
+						ASSERT_FALSE (block_a == nullptr);
+						ASSERT_FALSE (block_a->hash ().is_zero ());
+					});
+				}
+			}));
+		}
+		ASSERT_TIMELY (1000s, system.nodes[0]->balance (vxlnetwork::dev::genesis_key.pub) == (vxlnetwork::dev::constants.genesis_amount - num_of_threads * num_of_sends * 1000));
+	}
+	for (auto i (threads.begin ()), n (threads.end ()); i != n; ++i)
+	{
+		i->join ();
+	}
+}
+
+TEST (store, load)
+{
+	vxlnetwork::system system (1);
+	std::vector<boost::thread> threads;
+	for (auto i (0); i < 100; ++i)
+	{
+		threads.push_back (boost::thread ([&system] () {
+			for (auto i (0); i != 1000; ++i)
+			{
+				auto transaction (system.nodes[0]->store.tx_begin_write ());
+				for (auto j (0); j != 10; ++j)
+				{
+					vxlnetwork::account account;
+					vxlnetwork::random_pool::generate_block (account.bytes.data (), account.bytes.size ());
+					system.nodes[0]->store.confirmation_height.put (transaction, account, { 0, vxlnetwork::block_hash (0) });
+					system.nodes[0]->store.account.put (transaction, account, vxlnetwork::account_info ());
+				}
+			}
+		}));
+	}
+	for (auto & i : threads)
+	{
+		i.join ();
+	}
+}
+
+TEST (node, fork_storm)
+{
+	// WIP against issue #3709
+	// This should be set large enough to trigger a test failure, but not so large that
+	// simply allocating nodes in a reasonably normal test environment fails. (64 is overkill)
+	// On a 12-core/16GB linux server, the failure triggers often with 11 nodes, and almost
+	// always with higher values.
+	static const auto node_count (23);
+
+	vxlnetwork::node_flags flags;
+	flags.disable_max_peers_per_ip = true;
+	vxlnetwork::system system (node_count, vxlnetwork::transport::transport_type::tcp, flags);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	auto previous (system.nodes[0]->latest (vxlnetwork::dev::genesis_key.pub));
+	auto balance (system.nodes[0]->balance (vxlnetwork::dev::genesis_key.pub));
+	ASSERT_FALSE (previous.is_zero ());
+	for (auto node_j : system.nodes)
+	{
+		balance -= 1;
+		vxlnetwork::keypair key;
+		vxlnetwork::send_block send (previous, key.pub, balance, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, 0);
+		node_j->work_generate_blocking (send);
+		previous = send.hash ();
+		for (auto node_i : system.nodes)
+		{
+			auto send_result (node_i->process (send));
+			ASSERT_EQ (vxlnetwork::process_result::progress, send_result.code);
+			vxlnetwork::keypair rep;
+			auto open (std::make_shared<vxlnetwork::open_block> (previous, rep.pub, key.pub, key.prv, key.pub, 0));
+			node_i->work_generate_blocking (*open);
+			auto open_result (node_i->process (*open));
+			ASSERT_EQ (vxlnetwork::process_result::progress, open_result.code);
+			auto transaction (node_i->store.tx_begin_read ());
+			node_i->network.flood_block (open);
+		}
+	}
+	auto again (true);
+
+	int iteration (0);
+
+	// Stall detection (if there is no progress, the test will hang indefinitely)
+	auto old_empty (0);
+	auto old_single (0);
+	auto stall_count (0);
+
+	while (again)
+	{
+		auto empty = 0;
+		auto single = 0;
+		std::for_each (system.nodes.begin (), system.nodes.end (), [&] (std::shared_ptr<vxlnetwork::node> const & node_a) {
+			if (node_a->active.empty ())
+			{
+				++empty;
+			}
+			else
+			{
+				vxlnetwork::unique_lock<vxlnetwork::mutex> lock (node_a->active.mutex);
+				auto election = node_a->active.roots.begin ()->election;
+				lock.unlock ();
+				if (election->votes ().size () == 1)
+				{
+					++single;
+				}
+			}
+		});
+		ASSERT_NO_ERROR (system.poll ());
+
+		// If no progress is happening after a lot of iterations
+		// this test has uncovered something broken or made some
+		// bad assumptions.
+		if (old_empty == empty && old_single == single)
+		{
+			static const auto stall_tolerance (100000);
+			++stall_count;
+			ASSERT_LE (stall_count, stall_tolerance) << "Stall deteceted. These values were both expected to eventually reach 0 but have remained unchanged for " << stall_tolerance << " iterations. Empty: " << empty << " single: " << single << std::endl;
+		}
+		else
+		{
+			stall_count = 0;
+			old_empty = empty;
+			old_single = single;
+		}
+
+		again = (empty != 0) || (single != 0);
+
+		++iteration;
+	}
+	ASSERT_TRUE (true);
+}
+
+namespace
+{
+size_t heard_count (std::vector<uint8_t> const & nodes)
+{
+	auto result (0);
+	for (auto i (nodes.begin ()), n (nodes.end ()); i != n; ++i)
+	{
+		switch (*i)
+		{
+			case 0:
+				break;
+			case 1:
+				++result;
+				break;
+			case 2:
+				++result;
+				break;
+		}
+	}
+	return result;
+}
+}
+
+TEST (broadcast, world_broadcast_simulate)
+{
+	auto node_count (10000);
+	// 0 = starting state
+	// 1 = heard transaction
+	// 2 = repeated transaction
+	std::vector<uint8_t> nodes;
+	nodes.resize (node_count, 0);
+	nodes[0] = 1;
+	auto any_changed (true);
+	auto message_count (0);
+	while (any_changed)
+	{
+		any_changed = false;
+		for (auto i (nodes.begin ()), n (nodes.end ()); i != n; ++i)
+		{
+			switch (*i)
+			{
+				case 0:
+					break;
+				case 1:
+					for (auto j (nodes.begin ()), m (nodes.end ()); j != m; ++j)
+					{
+						++message_count;
+						switch (*j)
+						{
+							case 0:
+								*j = 1;
+								any_changed = true;
+								break;
+							case 1:
+								break;
+							case 2:
+								break;
+						}
+					}
+					*i = 2;
+					any_changed = true;
+					break;
+				case 2:
+					break;
+				default:
+					ASSERT_FALSE (true);
+					break;
+			}
+		}
+	}
+	auto count (heard_count (nodes));
+	(void)count;
+}
+
+TEST (broadcast, sqrt_broadcast_simulate)
+{
+	auto node_count (10000);
+	auto broadcast_count (std::ceil (std::sqrt (node_count)));
+	// 0 = starting state
+	// 1 = heard transaction
+	// 2 = repeated transaction
+	std::vector<uint8_t> nodes;
+	nodes.resize (node_count, 0);
+	nodes[0] = 1;
+	auto any_changed (true);
+	uint64_t message_count (0);
+	while (any_changed)
+	{
+		any_changed = false;
+		for (auto i (nodes.begin ()), n (nodes.end ()); i != n; ++i)
+		{
+			switch (*i)
+			{
+				case 0:
+					break;
+				case 1:
+					for (auto j (0); j != broadcast_count; ++j)
+					{
+						++message_count;
+						auto entry (vxlnetwork::random_pool::generate_word32 (0, node_count - 1));
+						switch (nodes[entry])
+						{
+							case 0:
+								nodes[entry] = 1;
+								any_changed = true;
+								break;
+							case 1:
+								break;
+							case 2:
+								break;
+						}
+					}
+					*i = 2;
+					any_changed = true;
+					break;
+				case 2:
+					break;
+				default:
+					ASSERT_FALSE (true);
+					break;
+			}
+		}
+	}
+	auto count (heard_count (nodes));
+	(void)count;
+}
+
+TEST (peer_container, random_set)
+{
+	vxlnetwork::system system (1);
+	auto old (std::chrono::steady_clock::now ());
+	auto current (std::chrono::steady_clock::now ());
+	for (auto i (0); i < 10000; ++i)
+	{
+		auto list (system.nodes[0]->network.random_set (15));
+	}
+	auto end (std::chrono::steady_clock::now ());
+	(void)end;
+	auto old_ms (std::chrono::duration_cast<std::chrono::milliseconds> (current - old));
+	(void)old_ms;
+	auto new_ms (std::chrono::duration_cast<std::chrono::milliseconds> (end - current));
+	(void)new_ms;
+}
+
+// Can take up to 2 hours
+TEST (store, unchecked_load)
+{
+	vxlnetwork::system system{ 1 };
+	auto & node = *system.nodes[0];
+	std::shared_ptr<vxlnetwork::block> block = std::make_shared<vxlnetwork::send_block> (0, 0, 0, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, 0);
+	constexpr auto num_unchecked = 1'000'000;
+	for (auto i (0); i < num_unchecked; ++i)
+	{
+		node.unchecked.put (i, block);
+	}
+	// Waits for all the blocks to get saved in the database
+	ASSERT_TIMELY (8000s, num_unchecked == node.unchecked.count (node.store.tx_begin_read ()));
+}
+
+TEST (store, vote_load)
+{
+	vxlnetwork::system system (1);
+	auto & node (*system.nodes[0]);
+	auto block (std::make_shared<vxlnetwork::send_block> (0, 0, 0, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, 0));
+	for (auto i (0); i < 1000000; ++i)
+	{
+		auto vote (std::make_shared<vxlnetwork::vote> (vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::genesis_key.prv, i, 0, block));
+		node.vote_processor.vote (vote, std::make_shared<vxlnetwork::transport::channel_loopback> (node));
+	}
+}
+
+/**
+ * This test does the following:
+ *   Creates a persistent database in the file system
+ *   Adds 2 million random blocks to the database in chunks of 20 blocks per database transaction
+ *   It then deletes half the blocks, soon after adding them
+ *   Then it closes the database, reopens the database and checks that it still has the expected amount of blocks
+ */
+TEST (store, pruned_load)
+{
+	vxlnetwork::logger_mt logger;
+	auto path (vxlnetwork::unique_path ());
+	constexpr auto num_pruned = 2000000;
+	auto const expected_result = num_pruned / 2;
+	constexpr auto batch_size = 20;
+	boost::unordered_set<vxlnetwork::block_hash> hashes;
+	{
+		auto store = vxlnetwork::make_store (logger, path, vxlnetwork::dev::constants);
+		ASSERT_FALSE (store->init_error ());
+		for (auto i (0); i < num_pruned / batch_size; ++i)
+		{
+			{
+				// write a batch of random blocks to the pruned store
+				auto transaction (store->tx_begin_write ());
+				for (auto k (0); k < batch_size; ++k)
+				{
+					vxlnetwork::block_hash random_hash;
+					vxlnetwork::random_pool::generate_block (random_hash.bytes.data (), random_hash.bytes.size ());
+					store->pruned.put (transaction, random_hash);
+					hashes.insert (random_hash);
+				}
+			}
+			{
+				// delete half of the blocks created above
+				auto transaction (store->tx_begin_write ());
+				for (auto k (0); !hashes.empty () && k < batch_size / 2; ++k)
+				{
+					auto hash (hashes.begin ());
+					store->pruned.del (transaction, *hash);
+					hashes.erase (hash);
+				}
+			}
+		}
+		ASSERT_EQ (expected_result, manually_count_pruned_blocks (*store));
+	}
+
+	// Reinitialize store
+	{
+		auto store = vxlnetwork::make_store (logger, path, vxlnetwork::dev::constants);
+		ASSERT_FALSE (store->init_error ());
+		ASSERT_EQ (expected_result, manually_count_pruned_blocks (*store));
+	}
+}
+
+TEST (wallets, rep_scan)
+{
+	vxlnetwork::system system (1);
+	auto & node (*system.nodes[0]);
+	auto wallet (system.wallet (0));
+	{
+		auto transaction (node.wallets.tx_begin_write ());
+		for (auto i (0); i < 10000; ++i)
+		{
+			wallet->deterministic_insert (transaction);
+		}
+	}
+	auto begin (std::chrono::steady_clock::now ());
+	node.wallets.foreach_representative ([] (vxlnetwork::public_key const & pub_a, vxlnetwork::raw_key const & prv_a) {
+	});
+	ASSERT_LT (std::chrono::steady_clock::now () - begin, std::chrono::milliseconds (5));
+}
+
+TEST (node, mass_vote_by_hash)
+{
+	vxlnetwork::system system (1);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	vxlnetwork::block_hash previous (vxlnetwork::dev::genesis->hash ());
+	vxlnetwork::keypair key;
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> blocks;
+	for (auto i (0); i < 10000; ++i)
+	{
+		auto block (std::make_shared<vxlnetwork::state_block> (vxlnetwork::dev::genesis_key.pub, previous, vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::constants.genesis_amount - (i + 1) * vxlnetwork::Gxrb_ratio, key.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (previous)));
+		previous = block->hash ();
+		blocks.push_back (block);
+	}
+	for (auto i (blocks.begin ()), n (blocks.end ()); i != n; ++i)
+	{
+		system.nodes[0]->block_processor.add (*i);
+	}
+}
+
+namespace vxlnetwork
+{
+TEST (confirmation_height, many_accounts_single_confirmation)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.online_weight_minimum = 100;
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto node = system.add_node (node_config);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+
+	// The number of frontiers should be more than the vxlnetwork::confirmation_height::unbounded_cutoff to test the amount of blocks confirmed is correct.
+	node->confirmation_height_processor.batch_write_size = 500;
+	auto const num_accounts = vxlnetwork::confirmation_height::unbounded_cutoff * 2 + 50;
+	vxlnetwork::keypair last_keypair = vxlnetwork::dev::genesis_key;
+	auto last_open_hash = node->latest (vxlnetwork::dev::genesis_key.pub);
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto i = num_accounts - 1; i > 0; --i)
+		{
+			vxlnetwork::keypair key;
+			system.wallet (0)->insert_adhoc (key.prv);
+
+			vxlnetwork::send_block send (last_open_hash, key.pub, node->online_reps.delta (), last_keypair.prv, last_keypair.pub, *system.work.generate (last_open_hash));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+			vxlnetwork::open_block open (send.hash (), last_keypair.pub, key.pub, key.prv, key.pub, *system.work.generate (key.pub));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, open).code);
+			last_open_hash = open.hash ();
+			last_keypair = key;
+		}
+	}
+
+	// Call block confirm on the last open block which will confirm everything
+	{
+		auto block = node->block (last_open_hash);
+		ASSERT_NE (nullptr, block);
+		node->scheduler.manual (block);
+		std::shared_ptr<vxlnetwork::election> election;
+		ASSERT_TIMELY (10s, (election = node->active.election (block->qualified_root ())) != nullptr);
+		election->force_confirm ();
+	}
+
+	ASSERT_TIMELY (120s, node->ledger.block_confirmed (node->store.tx_begin_read (), last_open_hash));
+
+	// All frontiers (except last) should have 2 blocks and both should be confirmed
+	auto transaction = node->store.tx_begin_read ();
+	for (auto i (node->store.account.begin (transaction)), n (node->store.account.end ()); i != n; ++i)
+	{
+		auto & account = i->first;
+		auto & account_info = i->second;
+		auto count = (account != last_keypair.pub) ? 2 : 1;
+		vxlnetwork::confirmation_height_info confirmation_height_info;
+		ASSERT_FALSE (node->store.confirmation_height.get (transaction, account, confirmation_height_info));
+		ASSERT_EQ (count, confirmation_height_info.height);
+		ASSERT_EQ (count, account_info.block_count);
+	}
+
+	size_t cemented_count = 0;
+	for (auto i (node->ledger.store.confirmation_height.begin (transaction)), n (node->ledger.store.confirmation_height.end ()); i != n; ++i)
+	{
+		cemented_count += i->second.height;
+	}
+
+	ASSERT_EQ (cemented_count, node->ledger.cache.cemented_count);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in), num_accounts * 2 - 2);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_bounded, vxlnetwork::stat::dir::in), num_accounts * 2 - 2);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_unbounded, vxlnetwork::stat::dir::in), 0);
+
+	ASSERT_TIMELY (40s, (node->ledger.cache.cemented_count - 1) == node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out));
+	ASSERT_TIMELY (10s, node->active.election_winner_details_size () == 0);
+}
+
+TEST (confirmation_height, many_accounts_many_confirmations)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.online_weight_minimum = 100;
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto node = system.add_node (node_config);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+
+	node->confirmation_height_processor.batch_write_size = 500;
+	auto const num_accounts = vxlnetwork::confirmation_height::unbounded_cutoff * 2 + 50;
+	auto latest_genesis = node->latest (vxlnetwork::dev::genesis_key.pub);
+	std::vector<std::shared_ptr<vxlnetwork::open_block>> open_blocks;
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto i = num_accounts - 1; i > 0; --i)
+		{
+			vxlnetwork::keypair key;
+			system.wallet (0)->insert_adhoc (key.prv);
+
+			vxlnetwork::send_block send (latest_genesis, key.pub, node->online_reps.delta (), vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+			auto open = std::make_shared<vxlnetwork::open_block> (send.hash (), vxlnetwork::dev::genesis_key.pub, key.pub, key.prv, key.pub, *system.work.generate (key.pub));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, *open).code);
+			open_blocks.push_back (std::move (open));
+			latest_genesis = send.hash ();
+		}
+	}
+
+	// Confirm all of the accounts
+	for (auto & open_block : open_blocks)
+	{
+		node->scheduler.manual (open_block);
+		std::shared_ptr<vxlnetwork::election> election;
+		ASSERT_TIMELY (10s, (election = node->active.election (open_block->qualified_root ())) != nullptr);
+		election->force_confirm ();
+	}
+
+	auto const num_blocks_to_confirm = (num_accounts - 1) * 2;
+	ASSERT_TIMELY (1500s, node->stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in) == num_blocks_to_confirm);
+
+	auto num_confirmed_bounded = node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_bounded, vxlnetwork::stat::dir::in);
+	ASSERT_GE (num_confirmed_bounded, vxlnetwork::confirmation_height::unbounded_cutoff);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_unbounded, vxlnetwork::stat::dir::in), num_blocks_to_confirm - num_confirmed_bounded);
+
+	ASSERT_TIMELY (60s, (node->ledger.cache.cemented_count - 1) == node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out));
+
+	auto transaction = node->store.tx_begin_read ();
+	size_t cemented_count = 0;
+	for (auto i (node->ledger.store.confirmation_height.begin (transaction)), n (node->ledger.store.confirmation_height.end ()); i != n; ++i)
+	{
+		cemented_count += i->second.height;
+	}
+
+	ASSERT_EQ (num_blocks_to_confirm + 1, cemented_count);
+	ASSERT_EQ (cemented_count, node->ledger.cache.cemented_count);
+
+	ASSERT_TIMELY (20s, (node->ledger.cache.cemented_count - 1) == node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out));
+
+	ASSERT_TIMELY (10s, node->active.election_winner_details_size () == 0);
+}
+
+TEST (confirmation_height, long_chains)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto node = system.add_node (node_config);
+	vxlnetwork::keypair key1;
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	vxlnetwork::block_hash latest (node->latest (vxlnetwork::dev::genesis_key.pub));
+	system.wallet (0)->insert_adhoc (key1.prv);
+
+	node->confirmation_height_processor.batch_write_size = 500;
+	auto const num_blocks = vxlnetwork::confirmation_height::unbounded_cutoff * 2 + 50;
+
+	// First open the other account
+	vxlnetwork::send_block send (latest, key1.pub, vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Gxrb_ratio + num_blocks + 1, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest));
+	vxlnetwork::open_block open (send.hash (), vxlnetwork::dev::genesis->account (), key1.pub, key1.prv, key1.pub, *system.work.generate (key1.pub));
+	{
+		auto transaction = node->store.tx_begin_write ();
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, open).code);
+	}
+
+	// Bulk send from genesis account to destination account
+	auto previous_genesis_chain_hash = send.hash ();
+	auto previous_destination_chain_hash = open.hash ();
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto i = num_blocks - 1; i > 0; --i)
+		{
+			vxlnetwork::send_block send (previous_genesis_chain_hash, key1.pub, vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Gxrb_ratio + i + 1, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (previous_genesis_chain_hash));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+			vxlnetwork::receive_block receive (previous_destination_chain_hash, send.hash (), key1.prv, key1.pub, *system.work.generate (previous_destination_chain_hash));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, receive).code);
+
+			previous_genesis_chain_hash = send.hash ();
+			previous_destination_chain_hash = receive.hash ();
+		}
+	}
+
+	// Send one from destination to genesis and pocket it
+	vxlnetwork::send_block send1 (previous_destination_chain_hash, vxlnetwork::dev::genesis_key.pub, vxlnetwork::Gxrb_ratio - 2, key1.prv, key1.pub, *system.work.generate (previous_destination_chain_hash));
+	auto receive1 (std::make_shared<vxlnetwork::state_block> (vxlnetwork::dev::genesis_key.pub, previous_genesis_chain_hash, vxlnetwork::dev::genesis->account (), vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Gxrb_ratio + 1, send1.hash (), vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (previous_genesis_chain_hash)));
+
+	// Unpocketed. Send to a non-existing account to prevent auto receives from the wallet adjusting expected confirmation height
+	vxlnetwork::keypair key2;
+	vxlnetwork::state_block send2 (vxlnetwork::dev::genesis->account (), receive1->hash (), vxlnetwork::dev::genesis->account (), vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Gxrb_ratio, key2.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (receive1->hash ()));
+
+	{
+		auto transaction = node->store.tx_begin_write ();
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send1).code);
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, *receive1).code);
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send2).code);
+	}
+
+	// Call block confirm on the existing receive block on the genesis account which will confirm everything underneath on both accounts
+	{
+		node->scheduler.manual (receive1);
+		std::shared_ptr<vxlnetwork::election> election;
+		ASSERT_TIMELY (10s, (election = node->active.election (receive1->qualified_root ())) != nullptr);
+		election->force_confirm ();
+	}
+
+	ASSERT_TIMELY (30s, node->ledger.block_confirmed (node->store.tx_begin_read (), receive1->hash ()));
+
+	auto transaction (node->store.tx_begin_read ());
+	vxlnetwork::account_info account_info;
+	ASSERT_FALSE (node->store.account.get (transaction, vxlnetwork::dev::genesis_key.pub, account_info));
+	vxlnetwork::confirmation_height_info confirmation_height_info;
+	ASSERT_FALSE (node->store.confirmation_height.get (transaction, vxlnetwork::dev::genesis_key.pub, confirmation_height_info));
+	ASSERT_EQ (num_blocks + 2, confirmation_height_info.height);
+	ASSERT_EQ (num_blocks + 3, account_info.block_count); // Includes the unpocketed send
+
+	ASSERT_FALSE (node->store.account.get (transaction, key1.pub, account_info));
+	ASSERT_FALSE (node->store.confirmation_height.get (transaction, key1.pub, confirmation_height_info));
+	ASSERT_EQ (num_blocks + 1, confirmation_height_info.height);
+	ASSERT_EQ (num_blocks + 1, account_info.block_count);
+
+	size_t cemented_count = 0;
+	for (auto i (node->ledger.store.confirmation_height.begin (transaction)), n (node->ledger.store.confirmation_height.end ()); i != n; ++i)
+	{
+		cemented_count += i->second.height;
+	}
+
+	ASSERT_EQ (cemented_count, node->ledger.cache.cemented_count);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in), num_blocks * 2 + 2);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_bounded, vxlnetwork::stat::dir::in), num_blocks * 2 + 2);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_unbounded, vxlnetwork::stat::dir::in), 0);
+
+	ASSERT_TIMELY (40s, (node->ledger.cache.cemented_count - 1) == node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out));
+	ASSERT_TIMELY (10s, node->active.election_winner_details_size () == 0);
+}
+
+TEST (confirmation_height, dynamic_algorithm)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto node = system.add_node (node_config);
+	vxlnetwork::keypair key;
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	auto const num_blocks = vxlnetwork::confirmation_height::unbounded_cutoff;
+	auto latest_genesis = vxlnetwork::dev::genesis;
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> state_blocks;
+	for (auto i = 0; i < num_blocks; ++i)
+	{
+		auto send (std::make_shared<vxlnetwork::state_block> (vxlnetwork::dev::genesis_key.pub, latest_genesis->hash (), vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::constants.genesis_amount - i - 1, key.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis->hash ())));
+		latest_genesis = send;
+		state_blocks.push_back (send);
+	}
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto const & block : state_blocks)
+		{
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, *block).code);
+		}
+	}
+
+	node->confirmation_height_processor.add (state_blocks.front ());
+	ASSERT_TIMELY (20s, node->ledger.cache.cemented_count == 2);
+
+	node->confirmation_height_processor.add (latest_genesis);
+
+	ASSERT_TIMELY (20s, node->ledger.cache.cemented_count == num_blocks + 1);
+
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in), num_blocks);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_bounded, vxlnetwork::stat::dir::in), 1);
+	ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_unbounded, vxlnetwork::stat::dir::in), num_blocks - 1);
+	ASSERT_TIMELY (10s, node->active.election_winner_details_size () == 0);
+}
+
+/*
+ * This tests an issue of incorrect cemented block counts during the transition of conf height algorithms
+ * The scenario was as follows:
+ *  - There is at least 1 pending write entry in the unbounded conf height processor
+ *  - 0 blocks currently awaiting processing in the main conf height processor class
+ *  - A block was confirmed when hit the chain in the pending write above but was not a block higher than it.
+ *  - It must be in `confirmation_height_processor::pause ()` function so that `pause` is set (and the difference between the number
+ *    of blocks uncemented is > unbounded_cutoff so that it hits the bounded processor), the main `run` loop on the conf height processor is iterated.
+ *
+ * This cause unbounded pending entries not to be written, and then the bounded processor would write them, causing some inconsistencies.
+*/
+TEST (confirmation_height, dynamic_algorithm_no_transition_while_pending)
+{
+	// Repeat in case of intermittent issues not replicating the issue talked about above.
+	for (auto _ = 0; _ < 3; ++_)
+	{
+		vxlnetwork::system system;
+		vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+		node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+		vxlnetwork::node_flags node_flags;
+		node_flags.force_use_write_database_queue = true;
+		auto node = system.add_node (node_config, node_flags);
+		vxlnetwork::keypair key;
+		system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+
+		auto latest_genesis = node->latest (vxlnetwork::dev::genesis_key.pub);
+		std::vector<std::shared_ptr<vxlnetwork::state_block>> state_blocks;
+		auto const num_blocks = vxlnetwork::confirmation_height::unbounded_cutoff - 2;
+
+		auto add_block_to_genesis_chain = [&] (vxlnetwork::write_transaction & transaction) {
+			static int num = 0;
+			auto send (std::make_shared<vxlnetwork::state_block> (vxlnetwork::dev::genesis_key.pub, latest_genesis, vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::constants.genesis_amount - num - 1, key.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis)));
+			latest_genesis = send->hash ();
+			state_blocks.push_back (send);
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, *send).code);
+			++num;
+		};
+
+		for (auto i = 0; i < num_blocks; ++i)
+		{
+			auto transaction = node->store.tx_begin_write ();
+			add_block_to_genesis_chain (transaction);
+		}
+
+		{
+			auto write_guard = node->write_database_queue.wait (vxlnetwork::writer::testing);
+			// To limit any data races we are not calling node.block_confirm
+			node->confirmation_height_processor.add (state_blocks.back ());
+
+			vxlnetwork::timer<> timer;
+			timer.start ();
+			while (node->confirmation_height_processor.current ().is_zero ())
+			{
+				ASSERT_LT (timer.since_start (), 2s);
+			}
+
+			// Pausing prevents any writes in the outer while loop in the confirmation height processor (implementation detail)
+			node->confirmation_height_processor.pause ();
+
+			timer.restart ();
+			ASSERT_TIMELY (10s, node->confirmation_height_processor.unbounded_processor.pending_writes_size != 0);
+
+			{
+				// Make it so that the number of blocks exceed the unbounded cutoff would go into the bounded processor (but shouldn't due to unbounded pending writes)
+				auto transaction = node->store.tx_begin_write ();
+				add_block_to_genesis_chain (transaction);
+				add_block_to_genesis_chain (transaction);
+			}
+			// Make sure this is at a height lower than the block in the add () call above
+			node->confirmation_height_processor.add (state_blocks.front ());
+			node->confirmation_height_processor.unpause ();
+		}
+
+		ASSERT_TIMELY (10s, node->ledger.cache.cemented_count == num_blocks + 1);
+
+		ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in), num_blocks);
+		ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_bounded, vxlnetwork::stat::dir::in), 0);
+		ASSERT_EQ (node->ledger.stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed_unbounded, vxlnetwork::stat::dir::in), num_blocks);
+		ASSERT_TIMELY (10s, node->active.election_winner_details_size () == 0);
+	}
+}
+
+TEST (confirmation_height, many_accounts_send_receive_self)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.online_weight_minimum = 100;
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	node_config.active_elections_size = 400000;
+	vxlnetwork::node_flags node_flags;
+	node_flags.confirmation_height_processor_mode = vxlnetwork::confirmation_height_mode::unbounded;
+	auto node = system.add_node (node_config);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+
+#ifndef NDEBUG
+	auto const num_accounts = 10000;
+#else
+	auto const num_accounts = 100000;
+#endif
+
+	auto latest_genesis = node->latest (vxlnetwork::dev::genesis_key.pub);
+	std::vector<vxlnetwork::keypair> keys;
+	std::vector<std::shared_ptr<vxlnetwork::open_block>> open_blocks;
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto i = 0; i < num_accounts; ++i)
+		{
+			vxlnetwork::keypair key;
+			keys.emplace_back (key);
+
+			vxlnetwork::send_block send (latest_genesis, key.pub, vxlnetwork::dev::constants.genesis_amount - 1 - i, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+			auto open = std::make_shared<vxlnetwork::open_block> (send.hash (), vxlnetwork::dev::genesis_key.pub, key.pub, key.prv, key.pub, *system.work.generate (key.pub));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, *open).code);
+			open_blocks.push_back (std::move (open));
+			latest_genesis = send.hash ();
+		}
+	}
+
+	// Confirm all of the accounts
+	for (auto & open_block : open_blocks)
+	{
+		node->block_confirm (open_block);
+		std::shared_ptr<vxlnetwork::election> election;
+		ASSERT_TIMELY (10s, (election = node->active.election (open_block->qualified_root ())) != nullptr);
+		election->force_confirm ();
+	}
+
+	system.deadline_set (100s);
+	auto num_blocks_to_confirm = num_accounts * 2;
+	while (node->stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in) != num_blocks_to_confirm)
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	std::vector<std::shared_ptr<vxlnetwork::send_block>> send_blocks;
+	std::vector<std::shared_ptr<vxlnetwork::receive_block>> receive_blocks;
+
+	for (int i = 0; i < open_blocks.size (); ++i)
+	{
+		auto open_block = open_blocks[i];
+		auto & keypair = keys[i];
+		send_blocks.emplace_back (std::make_shared<vxlnetwork::send_block> (open_block->hash (), keypair.pub, 1, keypair.prv, keypair.pub, *system.work.generate (open_block->hash ())));
+		receive_blocks.emplace_back (std::make_shared<vxlnetwork::receive_block> (send_blocks.back ()->hash (), send_blocks.back ()->hash (), keypair.prv, keypair.pub, *system.work.generate (send_blocks.back ()->hash ())));
+	}
+
+	// Now send and receive to self
+	for (int i = 0; i < open_blocks.size (); ++i)
+	{
+		node->process_active (send_blocks[i]);
+		node->process_active (receive_blocks[i]);
+	}
+
+	system.deadline_set (300s);
+	num_blocks_to_confirm = num_accounts * 4;
+	while (node->stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in) != num_blocks_to_confirm)
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	system.deadline_set (200s);
+	while ((node->ledger.cache.cemented_count - 1) != node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out))
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	auto transaction = node->store.tx_begin_read ();
+	size_t cemented_count = 0;
+	for (auto i (node->ledger.store.confirmation_height.begin (transaction)), n (node->ledger.store.confirmation_height.end ()); i != n; ++i)
+	{
+		cemented_count += i->second.height;
+	}
+
+	ASSERT_EQ (num_blocks_to_confirm + 1, cemented_count);
+	ASSERT_EQ (cemented_count, node->ledger.cache.cemented_count);
+
+	system.deadline_set (60s);
+	while ((node->ledger.cache.cemented_count - 1) != node->stats.count (vxlnetwork::stat::type::confirmation_observer, vxlnetwork::stat::detail::all, vxlnetwork::stat::dir::out))
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	system.deadline_set (60s);
+	while (node->active.election_winner_details_size () > 0)
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+}
+
+// Same as the many_accounts_send_receive_self test, except works on the confirmation height processor directly
+// as opposed to active transactions which implicitly calls confirmation height processor.
+TEST (confirmation_height, many_accounts_send_receive_self_no_elections)
+{
+	if (vxlnetwork::rocksdb_config::using_rocksdb_in_tests ())
+	{
+		// Don't test this in rocksdb mode
+		return;
+	}
+	vxlnetwork::logger_mt logger;
+	vxlnetwork::logging logging;
+	auto path (vxlnetwork::unique_path ());
+	auto store = vxlnetwork::make_store (logger, path, vxlnetwork::dev::constants);
+	ASSERT_TRUE (!store->init_error ());
+	vxlnetwork::stat stats;
+	vxlnetwork::ledger ledger (*store, stats, vxlnetwork::dev::constants);
+	vxlnetwork::write_database_queue write_database_queue (false);
+	vxlnetwork::work_pool pool{ vxlnetwork::dev::network_params.network, std::numeric_limits<unsigned>::max () };
+	std::atomic<bool> stopped{ false };
+	boost::latch initialized_latch{ 0 };
+
+	vxlnetwork::block_hash block_hash_being_processed{ 0 };
+	vxlnetwork::confirmation_height_processor confirmation_height_processor{ ledger, write_database_queue, 10ms, logging, logger, initialized_latch, confirmation_height_mode::automatic };
+
+	auto const num_accounts = 100000;
+
+	auto latest_genesis = vxlnetwork::dev::genesis->hash ();
+	std::vector<vxlnetwork::keypair> keys;
+	std::vector<std::shared_ptr<vxlnetwork::open_block>> open_blocks;
+
+	vxlnetwork::system system;
+
+	{
+		auto transaction (store->tx_begin_write ());
+		store->initialize (transaction, ledger.cache);
+
+		// Send from genesis account to all other accounts and create open block for them
+		for (auto i = 0; i < num_accounts; ++i)
+		{
+			vxlnetwork::keypair key;
+			keys.emplace_back (key);
+			vxlnetwork::send_block send (latest_genesis, key.pub, vxlnetwork::dev::constants.genesis_amount - 1 - i, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *pool.generate (latest_genesis));
+			ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, send).code);
+			auto open = std::make_shared<vxlnetwork::open_block> (send.hash (), vxlnetwork::dev::genesis_key.pub, key.pub, key.prv, key.pub, *pool.generate (key.pub));
+			ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, *open).code);
+			open_blocks.push_back (std::move (open));
+			latest_genesis = send.hash ();
+		}
+	}
+
+	for (auto & open_block : open_blocks)
+	{
+		confirmation_height_processor.add (open_block);
+	}
+
+	system.deadline_set (1000s);
+	auto num_blocks_to_confirm = num_accounts * 2;
+	while (stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in) != num_blocks_to_confirm)
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	std::vector<std::shared_ptr<vxlnetwork::send_block>> send_blocks;
+	std::vector<std::shared_ptr<vxlnetwork::receive_block>> receive_blocks;
+
+	// Now add all send/receive blocks
+	{
+		auto transaction (store->tx_begin_write ());
+		for (int i = 0; i < open_blocks.size (); ++i)
+		{
+			auto open_block = open_blocks[i];
+			auto & keypair = keys[i];
+			send_blocks.emplace_back (std::make_shared<vxlnetwork::send_block> (open_block->hash (), keypair.pub, 1, keypair.prv, keypair.pub, *system.work.generate (open_block->hash ())));
+			receive_blocks.emplace_back (std::make_shared<vxlnetwork::receive_block> (send_blocks.back ()->hash (), send_blocks.back ()->hash (), keypair.prv, keypair.pub, *system.work.generate (send_blocks.back ()->hash ())));
+
+			ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, *send_blocks.back ()).code);
+			ASSERT_EQ (vxlnetwork::process_result::progress, ledger.process (transaction, *receive_blocks.back ()).code);
+		}
+	}
+
+	// Randomize the order that send and receive blocks are added to the confirmation height processor
+	std::random_device rd;
+	std::mt19937 g (rd ());
+	std::shuffle (send_blocks.begin (), send_blocks.end (), g);
+	std::mt19937 g1 (rd ());
+	std::shuffle (receive_blocks.begin (), receive_blocks.end (), g1);
+
+	// Now send and receive to self
+	for (int i = 0; i < open_blocks.size (); ++i)
+	{
+		confirmation_height_processor.add (send_blocks[i]);
+		confirmation_height_processor.add (receive_blocks[i]);
+	}
+
+	system.deadline_set (1000s);
+	num_blocks_to_confirm = num_accounts * 4;
+	while (stats.count (vxlnetwork::stat::type::confirmation_height, vxlnetwork::stat::detail::blocks_confirmed, vxlnetwork::stat::dir::in) != num_blocks_to_confirm)
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	while (!confirmation_height_processor.current ().is_zero ())
+	{
+		ASSERT_NO_ERROR (system.poll ());
+	}
+
+	auto transaction = store->tx_begin_read ();
+	size_t cemented_count = 0;
+	for (auto i (store->confirmation_height.begin (transaction)), n (store->confirmation_height.end ()); i != n; ++i)
+	{
+		cemented_count += i->second.height;
+	}
+
+	ASSERT_EQ (num_blocks_to_confirm + 1, cemented_count);
+	ASSERT_EQ (cemented_count, ledger.cache.cemented_count);
+}
+
+// Can take up to 1 hour (recommend modifying test work difficulty base level to speed this up)
+TEST (confirmation_height, prioritize_frontiers_overwrite)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto node = system.add_node (node_config);
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+
+	auto num_accounts = node->active.max_priority_cementable_frontiers * 2;
+	vxlnetwork::keypair last_keypair = vxlnetwork::dev::genesis_key;
+	auto last_open_hash = node->latest (vxlnetwork::dev::genesis_key.pub);
+	// Clear confirmation height so that the genesis account has the same amount of uncemented blocks as the other frontiers
+	{
+		auto transaction = node->store.tx_begin_write ();
+		node->store.confirmation_height.clear (transaction);
+	}
+
+	{
+		auto transaction = node->store.tx_begin_write ();
+		for (auto i = num_accounts - 1; i > 0; --i)
+		{
+			vxlnetwork::keypair key;
+			system.wallet (0)->insert_adhoc (key.prv);
+
+			vxlnetwork::send_block send (last_open_hash, key.pub, vxlnetwork::Gxrb_ratio - 1, last_keypair.prv, last_keypair.pub, *system.work.generate (last_open_hash));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+			vxlnetwork::open_block open (send.hash (), last_keypair.pub, key.pub, key.prv, key.pub, *system.work.generate (key.pub));
+			ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, open).code);
+			last_open_hash = open.hash ();
+			last_keypair = key;
+		}
+	}
+
+	auto transaction = node->store.tx_begin_read ();
+	{
+		// Fill both priority frontier collections.
+		node->active.prioritize_frontiers_for_confirmation (transaction, std::chrono::seconds (60), std::chrono::seconds (60));
+		ASSERT_EQ (node->active.priority_cementable_frontiers_size () + node->active.priority_wallet_cementable_frontiers_size (), num_accounts);
+
+		// Confirm the last frontier has the least number of uncemented blocks
+		auto last_frontier_it = node->active.priority_cementable_frontiers.get<1> ().end ();
+		--last_frontier_it;
+		ASSERT_EQ (last_frontier_it->account, last_keypair.pub);
+		ASSERT_EQ (last_frontier_it->blocks_uncemented, 1);
+	}
+
+	// Add a new frontier with 1 block, it should not be added to the frontier container because it is not higher than any already in the maxed out container
+	vxlnetwork::keypair key;
+	auto latest_genesis = node->latest (vxlnetwork::dev::genesis_key.pub);
+	vxlnetwork::send_block send (latest_genesis, key.pub, vxlnetwork::Gxrb_ratio - 1, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis));
+	vxlnetwork::open_block open (send.hash (), vxlnetwork::dev::genesis_key.pub, key.pub, key.prv, key.pub, *system.work.generate (key.pub));
+	{
+		auto transaction = node->store.tx_begin_write ();
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, open).code);
+	}
+	transaction.refresh ();
+	node->active.prioritize_frontiers_for_confirmation (transaction, std::chrono::seconds (60), std::chrono::seconds (60));
+	ASSERT_EQ (node->active.priority_cementable_frontiers_size (), num_accounts / 2);
+	ASSERT_EQ (node->active.priority_wallet_cementable_frontiers_size (), num_accounts / 2);
+
+	// The account now has an extra block (2 in total) so has 1 more uncemented block than the next smallest frontier in the collection.
+	vxlnetwork::send_block send1 (send.hash (), key.pub, vxlnetwork::Gxrb_ratio - 2, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (send.hash ()));
+	vxlnetwork::receive_block receive (open.hash (), send1.hash (), key.prv, key.pub, *system.work.generate (open.hash ()));
+	{
+		auto transaction = node->store.tx_begin_write ();
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send1).code);
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, receive).code);
+	}
+
+	// Confirm that it gets replaced
+	transaction.refresh ();
+	node->active.prioritize_frontiers_for_confirmation (transaction, std::chrono::seconds (60), std::chrono::seconds (60));
+	ASSERT_EQ (node->active.priority_cementable_frontiers_size (), num_accounts / 2);
+	ASSERT_EQ (node->active.priority_wallet_cementable_frontiers_size (), num_accounts / 2);
+	ASSERT_EQ (node->active.priority_cementable_frontiers.find (last_keypair.pub), node->active.priority_cementable_frontiers.end ());
+	ASSERT_NE (node->active.priority_cementable_frontiers.find (key.pub), node->active.priority_cementable_frontiers.end ());
+
+	// Check there are no matching accounts found in both containers
+	for (auto it = node->active.priority_cementable_frontiers.begin (); it != node->active.priority_cementable_frontiers.end (); ++it)
+	{
+		ASSERT_EQ (node->active.priority_wallet_cementable_frontiers.find (it->account), node->active.priority_wallet_cementable_frontiers.end ());
+	}
+}
+}
+
+namespace
+{
+class data
+{
+public:
+	std::atomic<bool> awaiting_cache{ false };
+	std::atomic<bool> keep_requesting_metrics{ true };
+	std::shared_ptr<vxlnetwork::node> node;
+	std::chrono::system_clock::time_point orig_time;
+	std::atomic_flag orig_time_set = ATOMIC_FLAG_INIT;
+};
+class shared_data
+{
+public:
+	vxlnetwork::util::counted_completion write_completion{ 0 };
+	std::atomic<bool> done{ false };
+};
+
+template <typename T>
+void callback_process (shared_data & shared_data_a, data & data, T & all_node_data_a, std::chrono::system_clock::time_point last_updated)
+{
+	if (!data.orig_time_set.test_and_set ())
+	{
+		data.orig_time = last_updated;
+	}
+
+	if (data.awaiting_cache && data.orig_time != last_updated)
+	{
+		data.keep_requesting_metrics = false;
+	}
+	if (data.orig_time != last_updated)
+	{
+		data.awaiting_cache = true;
+		data.orig_time = last_updated;
+	}
+	shared_data_a.write_completion.increment ();
+};
+}
+
+TEST (telemetry, ongoing_requests)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_flags node_flags;
+	node_flags.disable_initial_telemetry_requests = true;
+	auto node_client = system.add_node (node_flags);
+	auto node_server = system.add_node (node_flags);
+
+	wait_peer_connections (system);
+
+	ASSERT_EQ (0, node_client->telemetry->telemetry_data_size ());
+	ASSERT_EQ (0, node_server->telemetry->telemetry_data_size ());
+	ASSERT_EQ (0, node_client->stats.count (vxlnetwork::stat::type::bootstrap, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (0, node_client->stats.count (vxlnetwork::stat::type::bootstrap, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+
+	ASSERT_TIMELY (20s, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in) == 1 && node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in) == 1);
+
+	// Wait till the next ongoing will be called, and add a 1s buffer for the actual processing
+	auto time = std::chrono::steady_clock::now ();
+	ASSERT_TIMELY (10s, std::chrono::steady_clock::now () >= (time + node_client->telemetry->cache_plus_buffer_cutoff_time () + 1s));
+
+	ASSERT_EQ (2, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+	ASSERT_EQ (2, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+}
+
+namespace vxlnetwork
+{
+namespace transport
+{
+	TEST (telemetry, simultaneous_requests)
+	{
+		vxlnetwork::system system;
+		vxlnetwork::node_flags node_flags;
+		node_flags.disable_initial_telemetry_requests = true;
+		auto const num_nodes = 4;
+		for (int i = 0; i < num_nodes; ++i)
+		{
+			system.add_node (node_flags);
+		}
+
+		wait_peer_connections (system);
+
+		std::vector<std::thread> threads;
+		auto const num_threads = 4;
+
+		std::array<data, num_nodes> node_data{};
+		for (auto i = 0; i < num_nodes; ++i)
+		{
+			node_data[i].node = system.nodes[i];
+		}
+
+		shared_data shared_data;
+
+		// Create a few threads where each node sends out telemetry request messages to all other nodes continuously, until the cache it reached and subsequently expired.
+		// The test waits until all telemetry_ack messages have been received.
+		for (int i = 0; i < num_threads; ++i)
+		{
+			threads.emplace_back ([&node_data, &shared_data] () {
+				while (std::any_of (node_data.cbegin (), node_data.cend (), [] (auto const & data) { return data.keep_requesting_metrics.load (); }))
+				{
+					for (auto & data : node_data)
+					{
+						// Keep calling get_metrics_async until the cache has been saved and then become outdated (after a certain period of time) for each node
+						if (data.keep_requesting_metrics)
+						{
+							shared_data.write_completion.increment_required_count ();
+
+							// Pick first peer to be consistent
+							auto peer = data.node->network.tcp_channels.channels[0].channel;
+							data.node->telemetry->get_metrics_single_peer_async (peer, [&shared_data, &data, &node_data] (vxlnetwork::telemetry_data_response const & telemetry_data_response_a) {
+								ASSERT_FALSE (telemetry_data_response_a.error);
+								callback_process (shared_data, data, node_data, telemetry_data_response_a.telemetry_data.timestamp);
+							});
+						}
+						std::this_thread::sleep_for (1ms);
+					}
+				}
+
+				shared_data.write_completion.await_count_for (20s);
+				shared_data.done = true;
+			});
+		}
+
+		ASSERT_TIMELY (30s, shared_data.done);
+
+		ASSERT_TRUE (std::all_of (node_data.begin (), node_data.end (), [] (auto const & data) { return !data.keep_requesting_metrics; }));
+
+		for (auto & thread : threads)
+		{
+			thread.join ();
+		}
+	}
+}
+}
+
+TEST (telemetry, under_load)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	vxlnetwork::node_flags node_flags;
+	node_flags.disable_initial_telemetry_requests = true;
+	auto node = system.add_node (node_config, node_flags);
+	node_config.peering_port = vxlnetwork::get_available_port ();
+	auto node1 = system.add_node (node_config, node_flags);
+	vxlnetwork::keypair key;
+	vxlnetwork::keypair key1;
+	system.wallet (0)->insert_adhoc (vxlnetwork::dev::genesis_key.prv);
+	system.wallet (0)->insert_adhoc (key.prv);
+	auto latest_genesis = node->latest (vxlnetwork::dev::genesis_key.pub);
+	auto num_blocks = 150000;
+	auto send (std::make_shared<vxlnetwork::state_block> (vxlnetwork::dev::genesis_key.pub, latest_genesis, vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::constants.genesis_amount - num_blocks, key.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest_genesis)));
+	node->process_active (send);
+	latest_genesis = send->hash ();
+	auto open (std::make_shared<vxlnetwork::state_block> (key.pub, 0, key.pub, num_blocks, send->hash (), key.prv, key.pub, *system.work.generate (key.pub)));
+	node->process_active (open);
+	auto latest_key = open->hash ();
+
+	auto thread_func = [key1, &system, node, num_blocks] (vxlnetwork::keypair const & keypair, vxlnetwork::block_hash const & latest, vxlnetwork::uint128_t const initial_amount) {
+		auto latest_l = latest;
+		for (int i = 0; i < num_blocks; ++i)
+		{
+			auto send (std::make_shared<vxlnetwork::state_block> (keypair.pub, latest_l, keypair.pub, initial_amount - i - 1, key1.pub, keypair.prv, keypair.pub, *system.work.generate (latest_l)));
+			latest_l = send->hash ();
+			node->process_active (send);
+		}
+	};
+
+	std::thread thread1 (thread_func, vxlnetwork::dev::genesis_key, latest_genesis, vxlnetwork::dev::constants.genesis_amount - num_blocks);
+	std::thread thread2 (thread_func, key, latest_key, num_blocks);
+
+	ASSERT_TIMELY (200s, node1->ledger.cache.block_count == num_blocks * 2 + 3);
+
+	thread1.join ();
+	thread2.join ();
+
+	for (auto const & node : system.nodes)
+	{
+		ASSERT_EQ (0, node->stats.count (vxlnetwork::stat::type::telemetry, vxlnetwork::stat::detail::failed_send_telemetry_req));
+		ASSERT_EQ (0, node->stats.count (vxlnetwork::stat::type::telemetry, vxlnetwork::stat::detail::request_within_protection_cache_zone));
+		ASSERT_EQ (0, node->stats.count (vxlnetwork::stat::type::telemetry, vxlnetwork::stat::detail::unsolicited_telemetry_ack));
+		ASSERT_EQ (0, node->stats.count (vxlnetwork::stat::type::telemetry, vxlnetwork::stat::detail::no_response_received));
+	}
+}
+
+/**
+ * This test checks that the telemetry cached data is consistent and that it timeouts when it should.
+ * It does the following:
+ * It disables ongoing telemetry requests and creates 2 nodes, client and server.
+ * The client node sends a manual telemetry req to the server node and waits for the telemetry reply.
+ * The telemetry reply is saved in the callback and then it is also requested via vxlnetwork::telemetry::get_metrics().
+ * The 2 telemetry data obtained by the 2 different methods are checked that they are the same.
+ * Then the test idles until the telemetry data timeouts from the cache.
+ * Then the manual req and reply process is repeated and checked.
+ */
+TEST (telemetry, cache_read_and_timeout)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_flags node_flags;
+	node_flags.disable_ongoing_telemetry_requests = true;
+	node_flags.disable_initial_telemetry_requests = true;
+	auto node_client = system.add_node (node_flags);
+	auto node_server = system.add_node (node_flags);
+
+	wait_peer_connections (system);
+
+	// Request telemetry metrics
+	vxlnetwork::telemetry_data telemetry_data;
+	{
+		std::atomic<bool> done{ false };
+		auto channel = node_client->network.find_channel (node_server->network.endpoint ());
+		node_client->telemetry->get_metrics_single_peer_async (channel, [&done, &telemetry_data] (vxlnetwork::telemetry_data_response const & response_a) {
+			telemetry_data = response_a.telemetry_data;
+			done = true;
+		});
+		ASSERT_TIMELY (10s, done);
+	}
+
+	auto responses = node_client->telemetry->get_metrics ();
+	ASSERT_TRUE (!responses.empty ());
+	ASSERT_EQ (telemetry_data, responses.begin ()->second);
+
+	// Confirm only 1 request was made
+	ASSERT_EQ (1, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (0, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (1, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+	ASSERT_EQ (0, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (1, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (0, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+
+	// wait until the telemetry data times out
+	ASSERT_TIMELY (node_server->telemetry->cache_plus_buffer_cutoff_time (), node_client->telemetry->get_metrics ().empty ());
+
+	// the telemetry data cache should be empty now
+	responses = node_client->telemetry->get_metrics ();
+	ASSERT_TRUE (responses.empty ());
+
+	// Request telemetry metrics again
+	{
+		std::atomic<bool> done{ false };
+		auto channel = node_client->network.find_channel (node_server->network.endpoint ());
+		node_client->telemetry->get_metrics_single_peer_async (channel, [&done, &telemetry_data] (vxlnetwork::telemetry_data_response const & response_a) {
+			telemetry_data = response_a.telemetry_data;
+			done = true;
+		});
+		ASSERT_TIMELY (10s, done);
+	}
+
+	responses = node_client->telemetry->get_metrics ();
+	ASSERT_TRUE (!responses.empty ());
+	ASSERT_EQ (telemetry_data, responses.begin ()->second);
+
+	ASSERT_EQ (2, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (0, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_client->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+	ASSERT_EQ (0, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_ack, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (2, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::in));
+	ASSERT_EQ (0, node_server->stats.count (vxlnetwork::stat::type::message, vxlnetwork::stat::detail::telemetry_req, vxlnetwork::stat::dir::out));
+}
+
+TEST (telemetry, many_nodes)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_flags node_flags;
+	node_flags.disable_ongoing_telemetry_requests = true;
+	node_flags.disable_initial_telemetry_requests = true;
+	node_flags.disable_request_loop = true;
+	// The telemetry responses can timeout if using a large number of nodes under sanitizers, so lower the number.
+	auto const num_nodes = (is_sanitizer_build || vxlnetwork::running_within_valgrind ()) ? 4 : 10;
+	for (auto i = 0; i < num_nodes; ++i)
+	{
+		vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+		// Make a metric completely different for each node so we can check afterwards that there are no duplicates
+		node_config.bandwidth_limit = 100000 + i;
+
+		auto node = std::make_shared<vxlnetwork::node> (system.io_ctx, vxlnetwork::unique_path (), node_config, system.work, node_flags);
+		node->start ();
+		system.nodes.push_back (node);
+	}
+
+	// Merge peers after creating nodes as some backends (RocksDB) can take a while to initialize nodes (Windows/Debug for instance)
+	// and timeouts can occur between nodes while starting up many nodes synchronously.
+	for (auto const & node : system.nodes)
+	{
+		for (auto const & other_node : system.nodes)
+		{
+			if (node != other_node)
+			{
+				node->network.merge_peer (other_node->network.endpoint ());
+			}
+		}
+	}
+
+	wait_peer_connections (system);
+
+	// Give all nodes a non-default number of blocks
+	vxlnetwork::keypair key;
+	vxlnetwork::state_block send (vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::genesis->hash (), vxlnetwork::dev::genesis_key.pub, vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Mxrb_ratio, key.pub, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (vxlnetwork::dev::genesis->hash ()));
+	for (auto node : system.nodes)
+	{
+		auto transaction (node->store.tx_begin_write ());
+		ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+	}
+
+	// This is the node which will request metrics from all other nodes
+	auto node_client = system.nodes.front ();
+
+	vxlnetwork::mutex mutex;
+	std::vector<vxlnetwork::telemetry_data> telemetry_datas;
+	auto peers = node_client->network.list (num_nodes - 1);
+	ASSERT_EQ (peers.size (), num_nodes - 1);
+	for (auto const & peer : peers)
+	{
+		node_client->telemetry->get_metrics_single_peer_async (peer, [&telemetry_datas, &mutex] (vxlnetwork::telemetry_data_response const & response_a) {
+			ASSERT_FALSE (response_a.error);
+			vxlnetwork::lock_guard<vxlnetwork::mutex> guard (mutex);
+			telemetry_datas.push_back (response_a.telemetry_data);
+		});
+	}
+
+	system.deadline_set (20s);
+	vxlnetwork::unique_lock<vxlnetwork::mutex> lk (mutex);
+	while (telemetry_datas.size () != num_nodes - 1)
+	{
+		lk.unlock ();
+		ASSERT_NO_ERROR (system.poll ());
+		lk.lock ();
+	}
+
+	// Check the metrics
+	for (auto & data : telemetry_datas)
+	{
+		ASSERT_EQ (data.unchecked_count, 0);
+		ASSERT_EQ (data.cemented_count, 1);
+		ASSERT_LE (data.peer_count, 9U);
+		ASSERT_EQ (data.account_count, 1);
+		ASSERT_TRUE (data.block_count == 2);
+		ASSERT_EQ (data.protocol_version, vxlnetwork::dev::network_params.network.protocol_version);
+		ASSERT_GE (data.bandwidth_cap, 100000);
+		ASSERT_LT (data.bandwidth_cap, 100000 + system.nodes.size ());
+		ASSERT_EQ (data.major_version, vxlnetwork::get_major_node_version ());
+		ASSERT_EQ (data.minor_version, vxlnetwork::get_minor_node_version ());
+		ASSERT_EQ (data.patch_version, vxlnetwork::get_patch_node_version ());
+		ASSERT_EQ (data.pre_release_version, vxlnetwork::get_pre_release_node_version ());
+		ASSERT_EQ (data.maker, 0);
+		ASSERT_LT (data.uptime, 100);
+		ASSERT_EQ (data.genesis_block, vxlnetwork::dev::genesis->hash ());
+		ASSERT_LE (data.timestamp, std::chrono::system_clock::now ());
+		ASSERT_EQ (data.active_difficulty, system.nodes.front ()->default_difficulty (vxlnetwork::work_version::work_1));
+	}
+
+	// We gave some nodes different bandwidth caps, confirm they are not all the same
+	auto bandwidth_cap = telemetry_datas.front ().bandwidth_cap;
+	telemetry_datas.erase (telemetry_datas.begin ());
+	auto all_bandwidth_limits_same = std::all_of (telemetry_datas.begin (), telemetry_datas.end (), [bandwidth_cap] (auto & telemetry_data) {
+		return telemetry_data.bandwidth_cap == bandwidth_cap;
+	});
+	ASSERT_FALSE (all_bandwidth_limits_same);
+}
+
+// Similar to signature_checker.boundary_checks but more exhaustive. Can take up to 1 minute
+TEST (signature_checker, mass_boundary_checks)
+{
+	// sizes container must be in incrementing order
+	std::vector<size_t> sizes{ 0, 1 };
+	auto add_boundary = [&sizes] (size_t boundary) {
+		sizes.insert (sizes.end (), { boundary - 1, boundary, boundary + 1 });
+	};
+
+	for (auto i = 1; i <= 10; ++i)
+	{
+		add_boundary (vxlnetwork::signature_checker::batch_size * i);
+	}
+
+	for (auto num_threads = 0; num_threads < 5; ++num_threads)
+	{
+		vxlnetwork::signature_checker checker (num_threads);
+		auto max_size = *(sizes.end () - 1);
+		std::vector<vxlnetwork::uint256_union> hashes;
+		hashes.reserve (max_size);
+		std::vector<unsigned char const *> messages;
+		messages.reserve (max_size);
+		std::vector<size_t> lengths;
+		lengths.reserve (max_size);
+		std::vector<unsigned char const *> pub_keys;
+		pub_keys.reserve (max_size);
+		std::vector<unsigned char const *> signatures;
+		signatures.reserve (max_size);
+		vxlnetwork::keypair key;
+		vxlnetwork::state_block block (key.pub, 0, key.pub, 0, 0, key.prv, key.pub, 0);
+
+		size_t last_size = 0;
+		for (auto size : sizes)
+		{
+			// The size needed to append to existing containers, saves re-initializing from scratch each iteration
+			auto extra_size = size - last_size;
+
+			std::vector<int> verifications;
+			verifications.resize (size);
+			for (auto i (0); i < extra_size; ++i)
+			{
+				hashes.push_back (block.hash ());
+				messages.push_back (hashes.back ().bytes.data ());
+				lengths.push_back (sizeof (decltype (hashes)::value_type));
+				pub_keys.push_back (block.hashables.account.bytes.data ());
+				signatures.push_back (block.signature.bytes.data ());
+			}
+			vxlnetwork::signature_check_set check = { size, messages.data (), lengths.data (), pub_keys.data (), signatures.data (), verifications.data () };
+			checker.verify (check);
+			bool all_valid = std::all_of (verifications.cbegin (), verifications.cend (), [] (auto verification) { return verification == 1; });
+			ASSERT_TRUE (all_valid);
+			last_size = size;
+		}
+	}
+}
+
+// Test the node epoch_upgrader with a large number of accounts and threads
+// Possible to manually add work peers
+TEST (node, mass_epoch_upgrader)
+{
+	auto perform_test = [] (size_t const batch_size) {
+		unsigned threads = 5;
+		size_t total_accounts = 2500;
+
+#ifndef NDEBUG
+		total_accounts /= 5;
+#endif
+
+		struct info
+		{
+			vxlnetwork::keypair key;
+			vxlnetwork::block_hash pending_hash;
+		};
+
+		std::vector<info> opened (total_accounts / 2);
+		std::vector<info> unopened (total_accounts / 2);
+
+		vxlnetwork::system system;
+		vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+		node_config.work_threads = 4;
+		//node_config.work_peers = { { "192.168.1.101", 7000 } };
+		auto & node = *system.add_node (node_config);
+
+		auto balance = node.balance (vxlnetwork::dev::genesis_key.pub);
+		auto latest = node.latest (vxlnetwork::dev::genesis_key.pub);
+		vxlnetwork::uint128_t amount = 1;
+
+		// Send to all accounts
+		std::array<std::vector<info> *, 2> all{ &opened, &unopened };
+		for (auto & accounts : all)
+		{
+			for (auto & info : *accounts)
+			{
+				balance -= amount;
+				vxlnetwork::state_block_builder builder;
+				std::error_code ec;
+				auto block = builder
+							 .account (vxlnetwork::dev::genesis_key.pub)
+							 .previous (latest)
+							 .balance (balance)
+							 .link (info.key.pub)
+							 .representative (vxlnetwork::dev::genesis_key.pub)
+							 .sign (vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub)
+							 .work (*node.work_generate_blocking (latest, node_config.network_params.work.threshold (vxlnetwork::work_version::work_1, vxlnetwork::block_details (vxlnetwork::epoch::epoch_0, false, false, false))))
+							 .build (ec);
+				ASSERT_FALSE (ec);
+				ASSERT_NE (nullptr, block);
+				ASSERT_EQ (vxlnetwork::process_result::progress, node.process (*block).code);
+				latest = block->hash ();
+				info.pending_hash = block->hash ();
+			}
+		}
+		ASSERT_EQ (1 + total_accounts, node.ledger.cache.block_count);
+		ASSERT_EQ (1, node.ledger.cache.account_count);
+
+		// Receive for half of accounts
+		for (auto const & info : opened)
+		{
+			vxlnetwork::state_block_builder builder;
+			std::error_code ec;
+			auto block = builder
+						 .account (info.key.pub)
+						 .previous (0)
+						 .balance (amount)
+						 .link (info.pending_hash)
+						 .representative (info.key.pub)
+						 .sign (info.key.prv, info.key.pub)
+						 .work (*node.work_generate_blocking (info.key.pub, node_config.network_params.work.threshold (vxlnetwork::work_version::work_1, vxlnetwork::block_details (vxlnetwork::epoch::epoch_0, false, false, false))))
+						 .build (ec);
+			ASSERT_FALSE (ec);
+			ASSERT_NE (nullptr, block);
+			ASSERT_EQ (vxlnetwork::process_result::progress, node.process (*block).code);
+		}
+		ASSERT_EQ (1 + total_accounts + opened.size (), node.ledger.cache.block_count);
+		ASSERT_EQ (1 + opened.size (), node.ledger.cache.account_count);
+
+		vxlnetwork::keypair epoch_signer (vxlnetwork::dev::genesis_key);
+
+		auto const block_count_before = node.ledger.cache.block_count.load ();
+		auto const total_to_upgrade = 1 + total_accounts;
+		std::cout << "Mass upgrading " << total_to_upgrade << " accounts" << std::endl;
+		while (node.ledger.cache.block_count != block_count_before + total_to_upgrade)
+		{
+			auto const pre_upgrade = node.ledger.cache.block_count.load ();
+			auto upgrade_count = std::min<size_t> (batch_size, block_count_before + total_to_upgrade - pre_upgrade);
+			ASSERT_FALSE (node.epoch_upgrader (epoch_signer.prv, vxlnetwork::epoch::epoch_1, upgrade_count, threads));
+			// Already ongoing - should fail
+			ASSERT_TRUE (node.epoch_upgrader (epoch_signer.prv, vxlnetwork::epoch::epoch_1, upgrade_count, threads));
+			system.deadline_set (60s);
+			while (node.ledger.cache.block_count != pre_upgrade + upgrade_count)
+			{
+				ASSERT_NO_ERROR (system.poll ());
+				std::this_thread::sleep_for (200ms);
+				std::cout << node.ledger.cache.block_count - block_count_before << " / " << total_to_upgrade << std::endl;
+			}
+			std::this_thread::sleep_for (50ms);
+		}
+		auto expected_blocks = block_count_before + total_accounts + 1;
+		ASSERT_EQ (expected_blocks, node.ledger.cache.block_count);
+		// Check upgrade
+		{
+			auto transaction (node.store.tx_begin_read ());
+			size_t block_count_sum = 0;
+			for (auto i (node.store.account.begin (transaction)); i != node.store.account.end (); ++i)
+			{
+				vxlnetwork::account_info info (i->second);
+				ASSERT_EQ (info.epoch (), vxlnetwork::epoch::epoch_1);
+				block_count_sum += info.block_count;
+			}
+			ASSERT_EQ (expected_blocks, block_count_sum);
+		}
+	};
+	// Test with a limited number of upgrades and an unlimited
+	perform_test (42);
+	perform_test (std::numeric_limits<size_t>::max ());
+}
+
+TEST (node, mass_block_new)
+{
+	vxlnetwork::system system;
+	vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+	node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+	auto & node = *system.add_node (node_config);
+	node.network_params.network.request_interval_ms = 500;
+
+#ifndef NDEBUG
+	auto const num_blocks = 5000;
+#else
+	auto const num_blocks = 50000;
+#endif
+	std::cout << num_blocks << " x4 blocks" << std::endl;
+
+	// Upgrade to epoch_2
+	system.upgrade_genesis_epoch (node, vxlnetwork::epoch::epoch_1);
+	system.upgrade_genesis_epoch (node, vxlnetwork::epoch::epoch_2);
+
+	auto next_block_count = num_blocks + 3;
+	auto process_all = [&] (std::vector<std::shared_ptr<vxlnetwork::state_block>> const & blocks_a) {
+		for (auto const & block : blocks_a)
+		{
+			node.process_active (block);
+		}
+		ASSERT_TIMELY (200s, node.ledger.cache.block_count == next_block_count);
+		next_block_count += num_blocks;
+		node.block_processor.flush ();
+		// Clear all active
+		{
+			vxlnetwork::lock_guard<vxlnetwork::mutex> guard (node.active.mutex);
+			node.active.roots.clear ();
+			node.active.blocks.clear ();
+		}
+	};
+
+	vxlnetwork::keypair key;
+	std::vector<vxlnetwork::keypair> keys (num_blocks);
+	vxlnetwork::state_block_builder builder;
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> send_blocks;
+	auto send_threshold (vxlnetwork::dev::network_params.work.threshold (vxlnetwork::work_version::work_1, vxlnetwork::block_details (vxlnetwork::epoch::epoch_2, true, false, false)));
+	auto latest_genesis = node.latest (vxlnetwork::dev::genesis_key.pub);
+	for (auto i = 0; i < num_blocks; ++i)
+	{
+		auto send = builder.make_block ()
+					.account (vxlnetwork::dev::genesis_key.pub)
+					.previous (latest_genesis)
+					.balance (vxlnetwork::dev::constants.genesis_amount - i - 1)
+					.representative (vxlnetwork::dev::genesis_key.pub)
+					.link (keys[i].pub)
+					.sign (vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub)
+					.work (*system.work.generate (vxlnetwork::work_version::work_1, latest_genesis, send_threshold))
+					.build ();
+		latest_genesis = send->hash ();
+		send_blocks.push_back (std::move (send));
+	}
+	std::cout << "Send blocks built, start processing" << std::endl;
+	vxlnetwork::timer<> timer;
+	timer.start ();
+	process_all (send_blocks);
+	std::cout << "Send blocks time: " << timer.stop ().count () << " " << timer.unit () << "\n\n";
+
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> open_blocks;
+	auto receive_threshold (vxlnetwork::dev::network_params.work.threshold (vxlnetwork::work_version::work_1, vxlnetwork::block_details (vxlnetwork::epoch::epoch_2, false, true, false)));
+	for (auto i = 0; i < num_blocks; ++i)
+	{
+		auto const & key = keys[i];
+		auto open = builder.make_block ()
+					.account (key.pub)
+					.previous (0)
+					.balance (1)
+					.representative (key.pub)
+					.link (send_blocks[i]->hash ())
+					.sign (key.prv, key.pub)
+					.work (*system.work.generate (vxlnetwork::work_version::work_1, key.pub, receive_threshold))
+					.build ();
+		open_blocks.push_back (std::move (open));
+	}
+	std::cout << "Open blocks built, start processing" << std::endl;
+	timer.restart ();
+	process_all (open_blocks);
+	std::cout << "Open blocks time: " << timer.stop ().count () << " " << timer.unit () << "\n\n";
+
+	// These blocks are from each key to themselves
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> send_blocks2;
+	for (auto i = 0; i < num_blocks; ++i)
+	{
+		auto const & key = keys[i];
+		auto const & latest = open_blocks[i];
+		auto send2 = builder.make_block ()
+					 .account (key.pub)
+					 .previous (latest->hash ())
+					 .balance (0)
+					 .representative (key.pub)
+					 .link (key.pub)
+					 .sign (key.prv, key.pub)
+					 .work (*system.work.generate (vxlnetwork::work_version::work_1, latest->hash (), send_threshold))
+					 .build ();
+		send_blocks2.push_back (std::move (send2));
+	}
+	std::cout << "Send2 blocks built, start processing" << std::endl;
+	timer.restart ();
+	process_all (send_blocks2);
+	std::cout << "Send2 blocks time: " << timer.stop ().count () << " " << timer.unit () << "\n\n";
+
+	// Each key receives the previously sent blocks
+	std::vector<std::shared_ptr<vxlnetwork::state_block>> receive_blocks;
+	for (auto i = 0; i < num_blocks; ++i)
+	{
+		auto const & key = keys[i];
+		auto const & latest = send_blocks2[i];
+		auto send2 = builder.make_block ()
+					 .account (key.pub)
+					 .previous (latest->hash ())
+					 .balance (1)
+					 .representative (key.pub)
+					 .link (latest->hash ())
+					 .sign (key.prv, key.pub)
+					 .work (*system.work.generate (vxlnetwork::work_version::work_1, latest->hash (), receive_threshold))
+					 .build ();
+		receive_blocks.push_back (std::move (send2));
+	}
+	std::cout << "Receive blocks built, start processing" << std::endl;
+	timer.restart ();
+	process_all (receive_blocks);
+	std::cout << "Receive blocks time: " << timer.stop ().count () << " " << timer.unit () << "\n\n";
+}
+
+TEST (node, wallet_create_block_confirm_conflicts)
+{
+	for (int i = 0; i < 5; ++i)
+	{
+		vxlnetwork::system system;
+		vxlnetwork::node_config node_config (vxlnetwork::get_available_port (), system.logging);
+		node_config.frontiers_confirmation = vxlnetwork::frontiers_confirmation_mode::disabled;
+		auto node = system.add_node (node_config);
+		auto const num_blocks = 10000;
+
+		// First open the other account
+		auto latest = vxlnetwork::dev::genesis->hash ();
+		vxlnetwork::keypair key1;
+		{
+			auto transaction = node->store.tx_begin_write ();
+			for (auto i = num_blocks - 1; i > 0; --i)
+			{
+				vxlnetwork::send_block send (latest, key1.pub, vxlnetwork::dev::constants.genesis_amount - vxlnetwork::Gxrb_ratio + i + 1, vxlnetwork::dev::genesis_key.prv, vxlnetwork::dev::genesis_key.pub, *system.work.generate (latest));
+				ASSERT_EQ (vxlnetwork::process_result::progress, node->ledger.process (transaction, send).code);
+				latest = send.hash ();
+			}
+		}
+
+		// Keep creating wallets. This is to check that there is no issues present when confirming blocks at the same time.
+		std::atomic<bool> done{ false };
+		std::thread t ([node, &done] () {
+			while (!done)
+			{
+				node->wallets.create (vxlnetwork::random_wallet_id ());
+			}
+		});
+
+		// Call block confirm on the top level send block which will confirm everything underneath on both accounts.
+		{
+			auto block = node->store.block.get (node->store.tx_begin_read (), latest);
+			node->scheduler.manual (block);
+			std::shared_ptr<vxlnetwork::election> election;
+			ASSERT_TIMELY (10s, (election = node->active.election (block->qualified_root ())) != nullptr);
+			election->force_confirm ();
+		}
+
+		ASSERT_TIMELY (120s, node->ledger.block_confirmed (node->store.tx_begin_read (), latest) && node->confirmation_height_processor.current () == 0);
+		done = true;
+		t.join ();
+	}
+}
